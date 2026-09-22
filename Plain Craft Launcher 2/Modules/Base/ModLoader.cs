@@ -708,6 +708,64 @@ public static class ModLoader
     {
         public object? input;
 
+        /// <summary>
+        ///     失败或取消时不清理目标实例文件夹。用于整合包安装，保留已下载的文件以便续装。
+        /// </summary>
+        public bool KeepInstanceOnFailure;
+
+        /// <summary>
+        ///     递归收集本组合及其子组合中的所有下载子加载器。
+        /// </summary>
+        private IEnumerable<PCL.Network.Loaders.LoaderDownload> GetAllDownloadLoaders()
+        {
+            foreach (var loader in loaders)
+                switch (loader)
+                {
+                    case PCL.Network.Loaders.LoaderDownload download:
+                    {
+                        yield return download;
+                        break;
+                    }
+                    case LoaderCombo combo:
+                    {
+                        foreach (var nested in combo.GetAllDownloadLoaders())
+                            yield return nested;
+
+                        break;
+                    }
+                }
+        }
+
+        /// <summary>
+        ///     当前是否存在可暂停且尚未暂停的下载子任务。
+        /// </summary>
+        public bool CanPause =>
+            State == ModBase.LoadState.Loading &&
+            GetAllDownloadLoaders().Any(d => d.State <= ModBase.LoadState.Loading && !d.IsPaused);
+
+        /// <summary>
+        ///     是否有下载子任务处于暂停状态。
+        /// </summary>
+        public bool IsPaused => GetAllDownloadLoaders().Any(d => d.IsPaused);
+
+        /// <summary>
+        ///     暂停所有下载子任务，包括嵌套组合内的：阻止新文件开始下载，并中断正在下载中的文件。
+        /// </summary>
+        public void Pause()
+        {
+            foreach (var download in GetAllDownloadLoaders())
+                download.Pause();
+        }
+
+        /// <summary>
+        ///     继续所有已暂停的下载子任务，包括嵌套组合内的。
+        /// </summary>
+        public void Resume()
+        {
+            foreach (var download in GetAllDownloadLoaders())
+                download.Resume();
+        }
+
         public List<LoaderBase> loaders = new();
 
         public LoaderCombo(string name, IEnumerable<LoaderBase> loaders)

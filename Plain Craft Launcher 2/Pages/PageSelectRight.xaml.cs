@@ -121,6 +121,196 @@ public partial class PageSelectRight
                 ModLoader.LoaderFolderRunType.ForceRun, 1, @"versions\");
     }
 
+    #region 未完成的整合包安装
+
+    /// <summary>
+    ///     在分类卡片末尾追加“未完成的整合包安装”卡片（本会话活任务 + PCL.ini 中断标记），
+    ///     样式与“错误”等分类卡片一致（默认折叠，点击标题展开）。
+    ///     返回是否添加了卡片。
+    /// </summary>
+    private bool AddModpackResumeCard()
+    {
+        try
+        {
+            var liveCombos = ModLoader.loaderTaskbar.OfType<ModLoader.LoaderCombo>()
+                .Where(c => c.KeepInstanceOnFailure && c.State == ModBase.LoadState.Loading)
+                .ToList();
+
+            string NameOf(ModLoader.LoaderCombo c) =>
+                Path.GetFileName((c.input?.ToString() ?? "").TrimEnd('\\'));
+
+            var searchText = PanVerSearchBox.Text.Trim().ToLower();
+            liveCombos = liveCombos
+                .Where(c => !string.IsNullOrEmpty(NameOf(c)) &&
+                            (string.IsNullOrEmpty(searchText) || NameOf(c).ToLower().Contains(searchText)))
+                .ToList();
+            var liveNames = liveCombos.Select(NameOf).ToHashSet();
+            var entries = ModModpack.GetModpackResumeEntries()
+                .Where(e => !liveNames.Contains(e.InstanceName) &&
+                            (string.IsNullOrEmpty(searchText) || e.InstanceName.ToLower().Contains(searchText)))
+                .ToList();
+            if (liveCombos.Count + entries.Count == 0)
+                return false;
+
+            var rows = new List<FrameworkElement>();
+            foreach (var combo in liveCombos) rows.Add(BuildLiveResumeRow(combo, NameOf(combo)));
+            foreach (var entry in entries) rows.Add(BuildMarkerResumeRow(entry));
+
+            // 若它是页面上第一张卡片，搜索框会被隐藏，需要自己留出与顶部栏的间距
+            var isFirstCard = PanMain.Children.Count == 0;
+            var newCard = new MyCard
+            {
+                Title = $"{Lang.Text("Select.Instance.ModpackResume.Title")} ({Lang.Number(liveCombos.Count + entries.Count, "N0")})",
+                Margin = new Thickness(0d, isFirstCard ? 15d : 0d, 0d, 15d)
+            };
+            var newStack = new StackPanel
+            {
+                Margin = new Thickness(20d, MyCard.SwapedHeight, 18d, 0d),
+                VerticalAlignment = VerticalAlignment.Top, RenderTransform = new TranslateTransform(0d, 0d),
+                Tag = rows
+            };
+            newCard.Children.Add(newStack);
+            newCard.SwapControl = newStack;
+            newCard.InstallMethod = stack =>
+            {
+                foreach (var row in (List<FrameworkElement>)stack.Tag) stack.Children.Add(row);
+            };
+            newCard.IsSwapped = true;
+            PanMain.Children.Add(newCard);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            ModBase.Log(ex, "构建未完成的整合包安装卡片失败");
+            return false;
+        }
+    }
+
+    /// <summary>
+    ///     构建与实例列表行风格一致的右侧图标按钮。
+    /// </summary>
+    private static MyIconButton MakeResumeRowButton(string svgIcon, string toolTip)
+    {
+        var btn = new MyIconButton { LogoScale = 1.1d, SvgIcon = svgIcon, ToolTip = toolTip };
+        ToolTipService.SetPlacement(btn, PlacementMode.Center);
+        ToolTipService.SetVerticalOffset(btn, 30d);
+        ToolTipService.SetHorizontalOffset(btn, 2d);
+        return btn;
+    }
+
+    private static MyListItem BuildResumeRowBase(string instanceName, string status)
+    {
+        return new MyListItem
+        {
+            Title = instanceName, Info = status, Height = 42d, SnapsToDevicePixels = true
+        };
+    }
+
+    private FrameworkElement BuildLiveResumeRow(ModLoader.LoaderCombo combo, string instanceName)
+    {
+        var item = BuildResumeRowBase(instanceName, "");
+        var btn = MakeResumeRowButton("lucide/pause", Lang.Text("Select.Instance.ModpackResume.ActionPause"));
+        var btnDelete =
+            MakeResumeRowButton("lucide/trash-2", Lang.Text("Select.Instance.ModpackResume.ActionDelete"));
+        void RefreshRow()
+        {
+            item.Info = Lang.Text(combo.IsPaused
+                ? "Select.Instance.ModpackResume.StatePaused"
+                : "Select.Instance.ModpackResume.StateInstalling");
+            btn.SvgIcon = combo.IsPaused ? "lucide/play" : "lucide/pause";
+            btn.ToolTip = Lang.Text(combo.IsPaused
+                ? "Select.Instance.ModpackResume.ActionResume"
+                : "Select.Instance.ModpackResume.ActionPause");
+            btn.IsEnabled = combo.IsPaused || combo.CanPause;
+        }
+
+        RefreshRow();
+        btn.Click += (_, _) =>
+        {
+            if (combo.IsPaused)
+                combo.Resume();
+            else if (combo.CanPause)
+                combo.Pause();
+            RefreshRow();
+        };
+        btnDelete.Click += (_, _) =>
+        {
+            var choice = ModMain.MyMsgBox(
+                Lang.Text("Select.Instance.ModpackResume.DeleteConfirm", instanceName),
+                null, Lang.Text("Select.Instance.ModpackResume.DeleteConfirmBoth"),
+                Lang.Text("Select.Instance.ModpackResume.DeleteConfirmOnly"),
+                Lang.Text("Common.Action.Cancel"), isWarn: true);
+            if (choice is < 1 or > 2)
+                return;
+            var deleteFiles = choice == 1;
+            // 与下载页面的“X”一致：移出任务列表并终止，右下角“返回下载页面”按钮随之消失
+            ModLoader.loaderTaskbar.Remove(combo);
+            ModMain.frmMain.BtnExtraDownload.ShowRefresh();
+            ModBase.RunInThread(() =>
+            {
+                try
+                {
+                    combo.Abort();
+                    for (var i = 0; i < 50 && combo.State == ModBase.LoadState.Loading; i++)
+                        Thread.Sleep(100);
+                    Thread.Sleep(1000); // 给下载器关闭文件句柄与清理临时文件留出时间，再删文件夹
+                }
+                catch (Exception ex)
+                {
+                    ModBase.Log(ex, "[ModPack] 终止进行中的整合包安装失败");
+                }
+
+                ModModpack.DeleteModpackResumeRecord(instanceName, deleteFiles);
+                ModBase.RunInUi(() =>
+                {
+                    ModInstanceList.mcInstanceListForceRefresh = true;
+                    McInstanceListUI(ModInstanceList.mcInstanceListLoader);
+                });
+            });
+        };
+        item.Buttons = new[] { btn, btnDelete };
+        return item;
+    }
+
+    private FrameworkElement BuildMarkerResumeRow(ModModpack.ModpackResumeEntryInfo entry)
+    {
+        var item = BuildResumeRowBase(entry.InstanceName,
+            Lang.Text("Select.Instance.ModpackResume.StateInterrupted"));
+        var btnContinue =
+            MakeResumeRowButton("lucide/play", Lang.Text("Select.Instance.ModpackResume.ActionContinue"));
+        btnContinue.Click += (_, _) =>
+        {
+            try
+            {
+                ModModpack.ResumeModpackInstall(entry);
+            }
+            catch (Exception ex)
+            {
+                ModBase.Log(ex, "从历史记录继续安装整合包失败", ModBase.LogLevel.Msgbox,
+                    userSummary: Lang.Text("Minecraft.Download.Modpack.Error.OperationFailed"));
+            }
+        };
+        var btnDelete =
+            MakeResumeRowButton("lucide/trash-2", Lang.Text("Select.Instance.ModpackResume.ActionDelete"));
+        btnDelete.Click += (_, _) =>
+        {
+            var choice = ModMain.MyMsgBox(
+                Lang.Text("Select.Instance.ModpackResume.DeleteConfirm", entry.InstanceName),
+                null, Lang.Text("Select.Instance.ModpackResume.DeleteConfirmBoth"),
+                Lang.Text("Select.Instance.ModpackResume.DeleteConfirmOnly"),
+                Lang.Text("Common.Action.Cancel"), isWarn: true);
+            if (choice is < 1 or > 2)
+                return;
+            ModModpack.DeleteModpackResumeRecord(entry.InstanceName, choice == 1);
+            ModInstanceList.mcInstanceListForceRefresh = true;
+            McInstanceListUI(ModInstanceList.mcInstanceListLoader);
+        };
+        item.Buttons = new[] { btnContinue, btnDelete };
+        return item;
+    }
+
+    #endregion
+
     #region 结果 UI 化
 
     private void McInstanceListUI(ModLoader.LoaderTask<string, int> loader)
@@ -294,8 +484,19 @@ public partial class PageSelectRight
 
             PanVerSearchBox.Visibility = hasVisibleFolders ? Visibility.Visible : Visibility.Collapsed;
 
+            // 未完成的整合包安装记录卡片
+            var hasResumeCard = AddModpackResumeCard();
+            if (hasResumeCard)
+            {
+                // 若此时仅有该卡片，则强制展开
+                if (PanMain.Children.Count == 1)
+                    ((MyCard)PanMain.Children[0]).IsSwapped = false;
+                PanEmpty.Visibility = Visibility.Collapsed;
+                PanBack.Visibility = Visibility.Visible;
+            }
+
             // 判断应该显示哪一个页面
-            if (!hasAnyResults)
+            if (!hasAnyResults && !hasResumeCard)
             {
                 if (!originalHasInstances)
                 {

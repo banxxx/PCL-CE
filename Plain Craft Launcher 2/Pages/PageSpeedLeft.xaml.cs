@@ -12,6 +12,7 @@ public partial class PageSpeedLeft
 
     // 定时器任务
     private readonly Dictionary<string, MyCard> rightCards = new();
+    private readonly Dictionary<string, MyIconButton> pauseButtons = new();
 
     // 初始化
     private bool isLoad;
@@ -123,7 +124,7 @@ public partial class PageSpeedLeft
             {
                 // 已有此卡片
                 Grid card = rightCards[loader.name];
-                var newValue = loader.Progress + (double)loader.State;
+                var newValue = GetCardTagValue(loader);
                 if (ModBase.Val(card.Tag) == newValue)
                     return;
                 card.Tag = newValue;
@@ -175,6 +176,7 @@ public partial class PageSpeedLeft
                         {
                             #region 进度不同，更新卡片
 
+                            RefreshPauseButton(loader);
                             do
                             {
                                 try
@@ -273,7 +275,7 @@ public partial class PageSpeedLeft
 
                     var cardXAML = $@"
                         <local:MyCard xmlns=""http://schemas.microsoft.com/winfx/2006/xaml/presentation"" xmlns:x=""http://schemas.microsoft.com/winfx/2006/xaml"" xmlns:local=""clr-namespace:PCL;assembly=Plain Craft Launcher 2""
-                            Tag=""{loader.Progress + (double)loader.State}"" Title=""{ModBase.EscapeXML(loader.name)}"" Margin=""0,0,0,15"">
+                            Tag=""{GetCardTagValue(loader)}"" Title=""{ModBase.EscapeXML(loader.name)}"" Margin=""0,0,0,15"">
                             <Grid Margin=""14,40,15,10"">
                                 <Grid.ColumnDefinitions>
                                     <ColumnDefinition Width=""50""/>
@@ -354,10 +356,33 @@ public partial class PageSpeedLeft
                                 ModMain.frmMain.PageBack();
                         });
                         rightCards.Remove(loader.name);
+                        pauseButtons.Remove(loader.name);
                         ModLoader.loaderTaskbar.Remove(loader);
                         ModBase.Log($"[Taskbar] 关闭任务管理卡片：{loader.name}，且移出任务列表");
                         ModBase.RunInThread(() => loader.Abort());
                     };
+                    // 为整合包安装任务添加暂停/继续按钮
+                    if (loader is ModLoader.LoaderCombo { KeepInstanceOnFailure: true } packCombo)
+                    {
+                        var pauseBtn = new MyIconButton
+                        {
+                            Name = "BtnPause",
+                            SvgIcon = "lucide/pause", Height = 25d, Width = 25d,
+                            Margin = new Thickness(0d, 10d, 45d, 0d), LogoScale = 1.1d,
+                            HorizontalAlignment = HorizontalAlignment.Right, VerticalAlignment = VerticalAlignment.Top
+                        };
+                        card.Children.Add(pauseBtn);
+                        pauseButtons[loader.name] = pauseBtn;
+                        pauseBtn.Click += (_, _) =>
+                        {
+                            if (packCombo.IsPaused)
+                                packCombo.Resume();
+                            else if (packCombo.CanPause)
+                                packCombo.Pause();
+                            RefreshPauseButton(loader);
+                        };
+                        RefreshPauseButton(loader);
+                    }
                     // 如果已经失败，再刷新一次，修改成失败的控件
                     if (loader.State == ModBase.LoadState.Failed)
                     {
@@ -388,6 +413,26 @@ public partial class PageSpeedLeft
         }
     }
 
+    private static double GetCardTagValue(ModLoader.LoaderBase loader)
+    {
+        var value = loader.Progress + (double)loader.State;
+        if (loader is ModLoader.LoaderCombo { IsPaused: true })
+            value += 1000d; // 暂停时进度不再变化，用该偏移强制卡片刷新按钮状态
+        return value;
+    }
+
+    private void RefreshPauseButton(ModLoader.LoaderBase loader)
+    {
+        if (!pauseButtons.TryGetValue(loader.name, out var btn) || loader is not ModLoader.LoaderCombo combo)
+            return;
+        ModBase.RunInUi(() =>
+        {
+            btn.SvgIcon = combo.IsPaused ? "lucide/play" : "lucide/pause";
+            btn.ToolTip = Lang.Text(combo.IsPaused ? "Speed.Task.Resume" : "Speed.Task.Pause");
+            btn.IsEnabled = combo.IsPaused || combo.CanPause;
+        });
+    }
+
     public void TaskRemove(ModLoader.LoaderBase loader)
     {
         if (rightCards.ContainsKey(loader.name))
@@ -397,6 +442,7 @@ public partial class PageSpeedLeft
                 Grid card = rightCards[loader.name];
                 ModMain.frmSpeedRight.PanMain.Children.Remove(card);
                 rightCards.Remove(loader.name);
+                pauseButtons.Remove(loader.name);
                 ModBase.Log($"[Watcher] 移除任务管理卡片：{loader.name}");
             });
     }

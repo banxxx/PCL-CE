@@ -405,6 +405,9 @@ public partial class PageDownloadCompDetail
                             cachedFolder.Add(file.Type, targetDir);
                     }
 
+                    // 实际的依赖解析与下载流程，查重确认后执行
+                    void StartFlow()
+                    {
                     if (file.Type == ModComp.CompType.Mod && Config.Download.Comp.AutoInstallDependencies &&
                         file.Dependencies.Any())
                     {
@@ -563,6 +566,33 @@ public partial class PageDownloadCompDetail
 
                     ModMain.frmMain.BtnExtraDownload.ShowRefresh();
                     ModMain.frmMain.BtnExtraDownload.Ribble();
+                    }
+
+                    // 下载前本地查重：命中完全相同的文件时提示，避免重复下载（扫描在后台线程执行，失败则静默放行）
+                    HintService.Hint(Lang.Text("Download.Comp.Dup.Checking"));
+                    ModBase.RunInNewThread(() =>
+                    {
+                        ModCompLocalDup.DupResult dup = null;
+                        try
+                        {
+                            dup = ModCompLocalDup.Check(targetDir, target, file);
+                        }
+                        catch (Exception ex)
+                        {
+                            ModBase.Log(ex, "[CompDup] 本地查重失败，按无重复处理", ModBase.LogLevel.Debug);
+                        }
+
+                        ModBase.RunInUi(() =>
+                        {
+                            if (dup is not null && !ModCompLocalDup.ConfirmDup(dup))
+                            {
+                                ModBase.Log($"[CompDup] 用户选择跳过重复下载：{dup.Kind} -> {dup.LocalPath}");
+                                return;
+                            }
+
+                            StartFlow();
+                        });
+                    }, "Download CompDetail DupCheck");
                 });
             }
             catch (Exception ex)

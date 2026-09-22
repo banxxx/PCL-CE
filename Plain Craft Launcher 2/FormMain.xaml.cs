@@ -1576,6 +1576,16 @@ public partial class FormMain
     /// </summary>
     public List<PageStackData> pageStack = new();
 
+    /// <summary>
+    ///     记录“从实例管理页进入下载顶级页”的来源，用于在下载页显示标题栏返回按钮。
+    /// </summary>
+    private PageStackData? _downloadPageReturnFrom;
+
+    /// <summary>
+    ///     来源的实例管理子页（模组/资源包等），返回时精确落回。
+    /// </summary>
+    private PageSubType _downloadPageReturnSub = PageSubType.Default;
+
     public class PageStackData
     {
         /// <summary>
@@ -1748,6 +1758,17 @@ public partial class FormMain
         PageBack();
     }
 
+    private void BtnTitleBack_Click(object sender, EventArgs e)
+    {
+        if (_downloadPageReturnFrom is null)
+            return;
+        var from = _downloadPageReturnFrom;
+        var sub = _downloadPageReturnSub;
+        _downloadPageReturnFrom = null;
+        // 返回进入下载页前的实例管理页，并落回当时的子页（模组/资源包/阴影等）
+        PageChange(from, sub);
+    }
+
     /// <summary>
     ///     通过点击返回按钮或手动触发返回来改变页面。
     /// </summary>
@@ -1775,6 +1796,18 @@ public partial class FormMain
             var pageName = PageNameGet(stack);
             if (string.IsNullOrEmpty(pageName))
             {
+                // 跨顶级页切换进入下载页时更新“返回来源”：从实例管理页进入则记录；
+                // 从下载页自身的子页面（任务管理、资源详情等）返回时保持不变；其他情况清除
+                if (pageCurrent != stack && stack.page == PageType.Download)
+                {
+                    if (pageCurrent == PageType.InstanceSetup)
+                    {
+                        _downloadPageReturnFrom = pageCurrent;
+                        _downloadPageReturnSub = PageCurrentSub; // 此刻仍在实例页，读到的是模组/资源包等真实子页
+                    }
+                    else if (!pageStack.Contains(PageType.Download))
+                        _downloadPageReturnFrom = null;
+                }
                 // 即将切换到一个顶级页面
                 PageChangeExit();
             }
@@ -1915,6 +1948,12 @@ public partial class FormMain
 
             BtnExtraDownload.ShowRefresh();
             BtnExtraApril.ShowRefresh();
+            // 标题栏返回按钮：仅在“从实例管理页进入的下载顶级页”上显示
+            BtnTitleBack.Visibility = _downloadPageReturnFrom is not null &&
+                                      pageCurrent == PageType.Download &&
+                                      string.IsNullOrEmpty(PageNameGet(pageCurrent))
+                ? Visibility.Visible
+                : Visibility.Collapsed;
 
             #endregion
 

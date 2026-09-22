@@ -3672,13 +3672,15 @@ public static class ModDownloadLib
             case ModBase.LoadState.Failed:
             {
                 HintService.Hint(
-                    $"{loader.name}{Lang.Text("Common.Status.Failure")}{loader.Error.Message}",
+                    $"{loader.name}{Lang.Text("Common.Status.Failure")}{loader.Error.Message}" +
+                    (((ModLoader.LoaderCombo)loader).KeepInstanceOnFailure ? "\n" + Lang.Text("Minecraft.Download.Modpack.Resume.KeptHint") : ""),
                     HintType.Error);
                 break;
             }
             case ModBase.LoadState.Aborted:
             {
-                HintService.Hint($"{loader.name}{Lang.Text("Common.Status.Cancelled")}");
+                HintService.Hint($"{loader.name}{Lang.Text("Common.Status.Cancelled")}" +
+                    (((ModLoader.LoaderCombo)loader).KeepInstanceOnFailure ? "，" + Lang.Text("Minecraft.Download.Modpack.Resume.KeptHint") : ""));
                 break;
             }
             case ModBase.LoadState.Loading:
@@ -3712,6 +3714,15 @@ public static class ModDownloadLib
         try
         {
             Thread.Sleep(1000); // 防止存在尚未完全释放的文件，导致清理失败（例如整合包安装）
+            var combo = (ModLoader.LoaderCombo)loader;
+            if (combo.KeepInstanceOnFailure &&
+                (combo.State == ModBase.LoadState.Failed || combo.State == ModBase.LoadState.Aborted))
+            {
+                // 整合包安装：保留实例文件夹以便重新导入时续装，不做任何清理
+                ModBase.Log($"[Download] 由于下载失败或取消，保留实例文件夹以便续装：{combo.input}", ModBase.LogLevel.Developer);
+                return;
+            }
+
             if (((ModLoader.LoaderBase)loader).State == ModBase.LoadState.Failed ||
                 ((ModLoader.LoaderBase)loader).State == ModBase.LoadState.Aborted)
             {

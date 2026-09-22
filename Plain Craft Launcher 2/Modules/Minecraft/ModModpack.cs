@@ -340,6 +340,205 @@ public static class ModModpack
         ModBase.IniClearCache(versionIni); // 重置缓存，避免被安装过程中写入的 ini 覆盖
     }
 
+    #region 整合包续装
+
+    /// <summary>
+    ///     基于整合包文件列表计算内容指纹（排序后取 SHA1），用于判断两次导入是否为同一个整合包版本。
+    /// </summary>
+    private static string GetModpackFingerprint(JsonNode filesNode, Func<JsonNode, string> keySelector)
+    {
+        var keys = (filesNode as JsonArray)?.OfType<JsonNode>()
+            .Select(keySelector)
+            .OrderBy(x => x, StringComparer.Ordinal)
+            .ToList() ?? new List<string>();
+        var hash = System.Security.Cryptography.SHA1.HashData(Encoding.UTF8.GetBytes(string.Join("\n", keys)));
+        return Convert.ToHexString(hash);
+    }
+
+    private static void WriteModpackResumeMarker(string instanceName, string source, string fingerprint,
+        string packVersion, string zipPath)
+    {
+        try
+        {
+            // 格式：source|指纹|版本|时间|zip 绝对路径（Windows 路径不允许出现 |，可安全作为最后一项）
+            ModBase.WriteIni(ModFolder.mcFolderSelected + "PCL.ini", $"ModpackResume|{instanceName}",
+                $"{source}|{fingerprint}|{packVersion}|{DateTime.Now:yyyyMMddHHmmss}|{zipPath}");
+        }
+        catch (Exception ex)
+        {
+            ModBase.Log(ex, "[ModPack] 写入整合包续装标记失败");
+        }
+    }
+
+    public static void DeleteModpackResumeMarker(string instanceName)
+    {
+        try
+        {
+            ModBase.DeleteIniKey(ModFolder.mcFolderSelected + "PCL.ini", $"ModpackResume|{instanceName}");
+        }
+        catch (Exception ex)
+        {
+            ModBase.Log(ex, "[ModPack] 删除整合包续装标记失败");
+        }
+    }
+
+    /// <summary>
+    ///     一条未完成的整合包安装记录（来自 PCL.ini 的续装标记）。
+    /// </summary>
+    public sealed class ModpackResumeEntryInfo
+    {
+        public string InstanceName = "";
+        public string Source = "";
+        public string Fingerprint = "";
+        public string PackVersion = "";
+        public string ZipPath = "";
+    }
+
+    /// <summary>
+    ///     枚举当前 .minecraft 下所有未完成的整合包安装记录。
+    /// </summary>
+    public static List<ModpackResumeEntryInfo> GetModpackResumeEntries()
+    {
+        var result = new List<ModpackResumeEntryInfo>();
+        try
+        {
+            var iniPath = ModFolder.mcFolderSelected + "PCL.ini";
+            if (!File.Exists(iniPath))
+                return result;
+            foreach (var rawLine in ModBase.ReadFile(iniPath).Split('\n'))
+            {
+                var line = rawLine.Trim();
+                // WriteIni 以第一个冒号分隔键值
+                var idx = line.IndexOf(':');
+                if (idx < 0 || !line.StartsWithF("ModpackResume|"))
+                    continue;
+                var instanceName = line[..idx].Trim()["ModpackResume|".Length..].Trim();
+                if (string.IsNullOrEmpty(instanceName))
+                    continue;
+                var parts = line[(idx + 1)..].Split('|');
+                if (parts.Length < 4)
+                    continue;
+                result.Add(new ModpackResumeEntryInfo
+                {
+                    InstanceName = instanceName,
+                    Source = parts[0],
+                    Fingerprint = parts[1],
+                    PackVersion = parts[2],
+                    ZipPath = parts.Length >= 5 ? string.Join("|", parts[4..]) : ""
+                });
+            }
+        }
+        catch (Exception ex)
+        {
+            ModBase.Log(ex, "[ModPack] 读取整合包续装记录失败");
+        }
+
+        return result;
+    }
+
+    /// <summary>
+    ///     从历史记录继续一次被中断的整合包安装。需在 UI 线程调用（可能弹出文件选择框）。
+    /// </summary>
+    public static void ResumeModpackInstall(ModpackResumeEntryInfo entry)
+    {
+        var file = entry.ZipPath;
+        if (string.IsNullOrEmpty(file) || !File.Exists(file))
+        {
+            HintService.Hint(Lang.Text("Minecraft.Download.Modpack.Resume.ZipMissing"), HintType.Error);
+            file = SystemDialogs.SelectFile(Lang.Text("Minecraft.Download.Modpack.FileDialog.Filter"),
+                Lang.Text("Minecraft.Download.Modpack.FileDialog.Title"));
+            if (string.IsNullOrEmpty(file))
+                return;
+        }
+
+        var selectedFile = file;
+        ModBase.RunInThread(() =>
+        {
+            try
+            {
+                ModpackInstall(selectedFile);
+            }
+            catch (ModBase.CancelledException)
+            {
+            }
+            catch (Exception ex)
+            {
+                ModBase.Log(ex, "继续安装整合包失败", ModBase.LogLevel.Msgbox,
+                    userSummary: Lang.Text("Minecraft.Download.Modpack.Error.OperationFailed"));
+            }
+        });
+    }
+
+    /// <summary>
+    ///     删除一条未完成的整合包安装记录。deleteFiles 为 True 时同时删除对应的实例文件夹。
+    /// </summary>
+    public static void DeleteModpackResumeRecord(string instanceName, bool deleteFiles)
+    {
+        DeleteModpackResumeMarker(instanceName);
+        if (!deleteFiles)
+            return;
+        try
+        {
+            var instanceFolder = $@"{ModFolder.mcFolderSelected}versions\{instanceName}\";
+            if (Directory.Exists(instanceFolder))
+                ModBase.DeleteDirectory(instanceFolder);
+        }
+        catch (Exception ex)
+        {
+            ModBase.Log(ex, "[ModPack] 删除未完成整合包实例文件夹失败");
+        }
+    }
+
+    /// <summary>
+    ///     检测到同一整合包存在未完成的安装时询问用户。
+    ///     返回 True 表示继续复用现有文件夹安装；返回 False 表示用户选择删除并已删除旧文件夹（实例名可继续使用）；
+    ///     返回 null 表示不存在可续装状态。
+    /// </summary>
+    /// <exception cref="ModBase.CancelledException" />
+    private static bool? TryResumeModpackInstall(string instanceName, string source, string fingerprint)
+    {
+        try
+        {
+            var instanceFolder = $@"{ModFolder.mcFolderSelected}versions\{instanceName}\";
+            if (!Directory.Exists(instanceFolder))
+                return null;
+            var saved = ModBase.ReadIni(ModFolder.mcFolderSelected + "PCL.ini", $"ModpackResume|{instanceName}", "");
+            if (string.IsNullOrEmpty(saved))
+                return null;
+            var parts = saved.Split('|');
+            if (parts.Length < 3 || parts[0] != source || parts[1] != fingerprint)
+                return null;
+            var choice = ModMain.MyMsgBox(
+                $"整合包“{instanceName}”存在未完成的安装。\n选择继续安装将复用已下载的文件，只补充下载缺失的部分。",
+                "发现未完成的整合包安装",
+                "继续安装", "删除并重新安装", "取消", isWarn: true);
+            if (choice == 1)
+            {
+                ModBase.Log("[ModPack] 用户选择继续未完成的整合包安装：" + instanceFolder);
+                return true;
+            }
+            if (choice == 2)
+            {
+                ModBase.Log("[ModPack] 用户选择删除并重新安装整合包：" + instanceFolder);
+                DeleteModpackResumeMarker(instanceName);
+                ModBase.DeleteDirectory(instanceFolder);
+                return false;
+            }
+            throw new ModBase.CancelledException();
+        }
+        catch (ModBase.CancelledException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            ModBase.Log(ex, "[ModPack] 检查整合包续装状态失败");
+            return null;
+        }
+    }
+
+    #endregion
+
     #region CurseForge
 
     private static LoaderCombo<string> InstallPackCurseForge(string fileAddress, ZipArchive archive,
@@ -361,13 +560,26 @@ public static class ModModpack
         if (json["minecraft"] is null || json["minecraft"]["version"] is null)
             throw new Exception("CurseForge 整合包未提供 Minecraft 版本信息");
 
+        // 续装识别（仅新建实例安装时支持）
+        var supportsResume = instanceName is null;
+        var resumeFingerprint = GetModpackFingerprint(json["files"], x => $"{x["projectID"]}:{x["fileID"]}");
+        var resumeVersion = json["version"]?.ToString() ?? "";
+        var resumingInstall = false;
+
         // 获取实例名
         if (instanceName is null)
         {
             instanceName = (string)(json["name"] ?? "");
             var validate = new FolderNameValidator(Path.Combine(ModFolder.mcFolderSelected, "versions"));
             if (!validate.Validate(instanceName).IsValid)
-                instanceName = "";
+            {
+                var resume = TryResumeModpackInstall(instanceName, "CurseForge", resumeFingerprint);
+                if (resume == true)
+                    resumingInstall = true;
+                else if (resume == null)
+                    instanceName = "";
+                // resume == false：旧实例文件夹已被用户确认删除，实例名可继续使用
+            }
             if (string.IsNullOrEmpty(instanceName))
                 instanceName = ModMain.MyMsgBoxInput(Lang.Text("Minecraft.Download.Modpack.InputInstanceName"), "", "",
                     [validate]);
@@ -578,7 +790,7 @@ public static class ModModpack
             neoForgeVersion = neoForgeVersion,
             fabricVersion = fabricVersion,
         };
-        var mergeLoaders = ModDownloadLib.McInstallLoader(request);
+        var mergeLoaders = ModDownloadLib.McInstallLoader(request, ignoreDump: resumingInstall);
         // 构造总加载器
         var loaders = new List<LoaderBase>();
         loaders.Add(new LoaderCombo<string>(Lang.Text("Minecraft.Download.Modpack.Stage.ModpackInstall"),
@@ -616,6 +828,7 @@ public static class ModModpack
             if (json["version"] is not null) States.Instance.ModpackVersion[versionFolder] = json["version"].ToString();
             States.Instance.ModpackSource[versionFolder] = "CurseForge";
             States.Instance.ModpackId[versionFolder] = resourceId;
+            DeleteModpackResumeMarker(instanceName); // 安装完成，移除续装标记
             do
             {
                 try
@@ -645,7 +858,12 @@ public static class ModModpack
         }
 
         // 启动
-        var loader = new LoaderCombo<string>(loaderName, loaders) { OnStateChanged = ModDownloadLib.McInstallState };
+        if (supportsResume)
+            WriteModpackResumeMarker(instanceName, "CurseForge", resumeFingerprint, resumeVersion, fileAddress);
+        var loader = new LoaderCombo<string>(loaderName, loaders)
+        {
+            OnStateChanged = ModDownloadLib.McInstallState, KeepInstanceOnFailure = true
+        };
         loader.Start(request.targetInstanceFolder);
         LoaderTaskbarAdd(loader);
         ModMain.frmMain.BtnExtraDownload.ShowRefresh();
@@ -725,13 +943,27 @@ public static class ModModpack
                 }
             }
 
+        // 续装识别（仅新建实例安装时支持）
+        var supportsResume = instanceName is null;
+        var resumeFingerprint = GetModpackFingerprint(json["files"],
+            x => $"{x["path"]}|{x["hashes"]?["sha1"]}");
+        var resumeVersion = json["versionId"]?.ToString() ?? "";
+        var resumingInstall = false;
+
         // 获取实例名
         if (instanceName is null)
         {
             instanceName = (string)(json["name"] ?? "");
             var validate = new FolderNameValidator(Path.Combine(ModFolder.mcFolderSelected, "versions"));
             if (!validate.Validate(instanceName).IsValid)
-                instanceName = "";
+            {
+                var resume = TryResumeModpackInstall(instanceName, "Modrinth", resumeFingerprint);
+                if (resume == true)
+                    resumingInstall = true;
+                else if (resume == null)
+                    instanceName = "";
+                // resume == false：旧实例文件夹已被用户确认删除，实例名可继续使用
+            }
             if (string.IsNullOrEmpty(instanceName))
                 instanceName = ModMain.MyMsgBoxInput(Lang.Text("Minecraft.Download.Modpack.InputInstanceName"), "", "",
                     [validate]);
@@ -819,7 +1051,7 @@ public static class ModModpack
             neoForgeVersion = neoForgeVersion,
             fabricVersion = fabricVersion,
         };
-        var mergeLoaders = ModDownloadLib.McInstallLoader(request);
+        var mergeLoaders = ModDownloadLib.McInstallLoader(request, ignoreDump: resumingInstall);
         // 构造总加载器
         var loaders = new List<LoaderBase>();
         loaders.Add(new LoaderCombo<string>(Lang.Text("Minecraft.Download.Modpack.Stage.ModpackInstall"),
@@ -858,6 +1090,7 @@ public static class ModModpack
                 States.Instance.ModpackVersion[versionFolder] = json["versionId"].ToString();
             States.Instance.ModpackSource[versionFolder] = "Modrinth";
             States.Instance.ModpackId[versionFolder] = resourceId;
+            DeleteModpackResumeMarker(instanceName); // 安装完成，移除续装标记
             do
             {
                 try
@@ -887,7 +1120,12 @@ public static class ModModpack
         }
 
         // 启动
-        var loader = new LoaderCombo<string>(loaderName, loaders) { OnStateChanged = ModDownloadLib.McInstallState };
+        if (supportsResume)
+            WriteModpackResumeMarker(instanceName, "Modrinth", resumeFingerprint, resumeVersion, fileAddress);
+        var loader = new LoaderCombo<string>(loaderName, loaders)
+        {
+            OnStateChanged = ModDownloadLib.McInstallState, KeepInstanceOnFailure = true
+        };
         loader.Start(request.targetInstanceFolder);
         LoaderTaskbarAdd(loader);
         ModMain.frmMain.BtnExtraDownload.ShowRefresh();
@@ -965,7 +1203,10 @@ public static class ModModpack
         }
 
         // 启动
-        var loader = new LoaderCombo<string>(loaderName, loaders) { OnStateChanged = ModDownloadLib.McInstallState };
+        var loader = new LoaderCombo<string>(loaderName, loaders)
+        {
+            OnStateChanged = ModDownloadLib.McInstallState, KeepInstanceOnFailure = true
+        };
         loader.Start(request.targetInstanceFolder);
         LoaderTaskbarAdd(loader);
         ModMain.frmMain.BtnExtraDownload.ShowRefresh();
@@ -1113,6 +1354,7 @@ public static class ModModpack
         // 启动任务
         var loader = new LoaderCombo<string>(loaderName, loaders);
         loader.OnStateChanged = ModDownloadLib.McInstallState;
+        loader.KeepInstanceOnFailure = true;
 
         loader.Start(request.targetInstanceFolder);
         LoaderTaskbarAdd(loader);
@@ -1271,7 +1513,7 @@ public static class ModModpack
             })
         })
         {
-            OnStateChanged = ModDownloadLib.McInstallState
+            OnStateChanged = ModDownloadLib.McInstallState, KeepInstanceOnFailure = true
         };
         loader.Start(targetFolder);
         LoaderTaskbarAdd(loader);
@@ -1726,7 +1968,10 @@ public static class ModModpack
         }
 
         // 启动
-        var loader = new LoaderCombo<string>(loaderName, loaders) { OnStateChanged = ModDownloadLib.McInstallState };
+        var loader = new LoaderCombo<string>(loaderName, loaders)
+        {
+            OnStateChanged = ModDownloadLib.McInstallState, KeepInstanceOnFailure = true
+        };
         loader.Start(request.targetInstanceFolder);
         LoaderTaskbarAdd(loader);
         ModMain.frmMain.BtnExtraDownload.ShowRefresh();
